@@ -1129,6 +1129,12 @@ int call_modify(struct call *call)
 }
 
 
+struct mnat_sess *call_mnat_sess(struct call *call)
+{
+	return call ? call->mnats : NULL;
+}
+
+
 /**
  * Send a re-INVITE without SDP offer
  *

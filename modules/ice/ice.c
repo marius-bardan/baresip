@@ -1010,6 +1010,62 @@ static void attr_handler(struct mnat_media *mm,
 }
 
 
+
+int ice_restart(struct mnat_sess *sess)
+{
+	struct le *le;
+	int err = 0;
+
+	if (!sess)
+		return EINVAL;
+
+	info("ice: restarting ICE session (network handover)\n");
+
+	rand_str(sess->lufrag, sizeof(sess->lufrag));
+	rand_str(sess->lpwd, sizeof(sess->lpwd));
+	sess->started = false;
+
+	LIST_FOREACH(&sess->medial, le) {
+		struct mnat_media *m = le->data;
+		enum ice_role role;
+
+		if (sess->offerer)
+			role = ICE_ROLE_CONTROLLING;
+		else
+			role = ICE_ROLE_CONTROLLED;
+
+		if (m->icem) {
+			icem_conncheck_stop(m->icem, 0);
+			m->icem = mem_deref(m->icem);
+		}
+
+		m->complete = false;
+		m->gathered = false;
+
+		err = icem_alloc(&m->icem, role, IPPROTO_UDP, ICE_LAYER,
+				 sess->tiebrk, sess->lufrag, sess->lpwd,
+				 conncheck_handler, m);
+		if (err)
+			return err;
+
+		icem_set_conf(m->icem, icem_conf(m->icem));
+		icem_set_name(m->icem, sdp_media_name(m->sdpm));
+
+		unsigned i;
+		for (i = 0; i < 2; i++) {
+			if (m->compv[i].sock)
+				err |= icem_comp_add(m->icem, i+1,
+						     m->compv[i].sock);
+		}
+
+		if (sa_isset(&sess->srv, SA_ALL))
+			err |= media_start(sess, m);
+	}
+
+	return err;
+}
+
+
 static struct mnat mnat_ice = {
 	.id      = "ice",
 	.ftag    = "+sip.ice",
