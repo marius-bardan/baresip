@@ -15,6 +15,9 @@ struct auplay_st {
 	struct audiosess_st *sess;
 	struct auplay_prm prm;
 	AudioUnit au;
+#if TARGET_OS_IPHONE
+	bool au_acquired;
+#endif
 	mtx_t mutex;
 	uint32_t sampsz;
 	auplay_write_h *wh;
@@ -30,9 +33,21 @@ static void auplay_destructor(void *arg)
 	st->wh = NULL;
 	mtx_unlock(&st->mutex);
 
+#if TARGET_OS_IPHONE
+	/*
+	 * On iOS the AU is owned by the shared holder. The holder takes
+	 * care of Stop / Uninitialize / Dispose on the final release.
+	 */
+	if (st->au_acquired) {
+		audiounit_holder_release();
+		st->au_acquired = false;
+	}
+	st->au = NULL;
+#else
 	AudioOutputUnitStop(st->au);
 	AudioUnitUninitialize(st->au);
 	AudioComponentInstanceDispose(st->au);
+#endif
 
 	mem_deref(st->sess);
 
@@ -90,10 +105,25 @@ static void interrupt_handler(bool interrupted, void *arg)
 {
 	struct auplay_st *st = arg;
 
+#if TARGET_OS_IPHONE
+	/*
+	 * Start / Stop on iOS go through the shared holder so we never
+	 * bounce the AU from underneath the recorder filter.
+	 */
+	if (interrupted) {
+		if (st->au)
+			AudioOutputUnitStop(st->au);
+	}
+	else {
+		if (st->au)
+			AudioOutputUnitStart(st->au);
+	}
+#else
 	if (interrupted)
 		AudioOutputUnitStop(st->au);
 	else
 		AudioOutputUnitStart(st->au);
+#endif
 }
 
 
@@ -102,13 +132,15 @@ int audiounit_player_alloc(struct auplay_st **stp, const struct auplay *ap,
 			   auplay_write_h *wh, void *arg)
 {
 	AudioStreamBasicDescription fmt;
-	const AudioUnitElement outputBus = 0;
 	AURenderCallbackStruct cb;
 	struct auplay_st *st;
+#if ! TARGET_OS_IPHONE
+	const AudioUnitElement outputBus = 0;
 	const UInt32 enable = 1;
+	UInt32 hw_size = sizeof(hw_srate);
+#endif
 	OSStatus ret = 0;
 	Float64 hw_srate = 0.0;
-	UInt32 hw_size = sizeof(hw_srate);
 	int err;
 
 	(void)device;
@@ -141,18 +173,6 @@ int audiounit_player_alloc(struct auplay_st **stp, const struct auplay *ap,
 	if (err)
 		goto out;
 
-	ret = AudioComponentInstanceNew(audiounit_comp_io, &st->au);
-	if (ret)
-		goto out;
-
-	ret = AudioUnitSetProperty(st->au, kAudioOutputUnitProperty_EnableIO,
-				   kAudioUnitScope_Output, outputBus,
-				   &enable, sizeof(enable));
-	if (ret) {
-		warning("audiounit: EnableIO failed (%d)\n", ret);
-		goto out;
-	}
-
 	fmt.mSampleRate       = prm->srate;
 	fmt.mFormatID         = kAudioFormatLinearPCM;
 #if TARGET_OS_IPHONE
@@ -169,9 +189,60 @@ int audiounit_player_alloc(struct auplay_st **stp, const struct auplay *ap,
 	fmt.mFramesPerPacket  = 1;
 	fmt.mBytesPerPacket   = st->sampsz * prm->ch;
 
-	ret = AudioUnitInitialize(st->au);
+	cb.inputProc = output_callback;
+	cb.inputProcRefCon = st;
+
+#if TARGET_OS_IPHONE
+	/*
+	 * iOS: share the VPIO instance with the recorder.
+	 * acquire -> configure (format + callback) -> start. If the
+	 * recorder got here first the AU is already started; our
+	 * _start() is idempotent and just wires our render callback
+	 * into the running graph.
+	 *
+	 * Contract order Enable → format → callback → Initialize →
+	 * Start still holds: Enable happens once in the holder,
+	 * format + callback are set here before _start() calls
+	 * Initialize (when needed), then Start.
+	 */
+	err = audiounit_holder_acquire(&st->au);
+	if (err) {
+		ret = 0;
+		goto out;
+	}
+	st->au_acquired = true;
+
+	err = audiounit_holder_set_output_format(&fmt);
+	if (err) {
+		ret = 0;
+		goto out;
+	}
+
+	err = audiounit_holder_set_render_cb(&cb);
+	if (err) {
+		ret = 0;
+		goto out;
+	}
+
+	err = audiounit_holder_start();
+	if (err) {
+		ret = 0;
+		goto out;
+	}
+
+	hw_srate = prm->srate;
+#else
+	ret = AudioComponentInstanceNew(audiounit_comp_io, &st->au);
 	if (ret)
 		goto out;
+
+	ret = AudioUnitSetProperty(st->au, kAudioOutputUnitProperty_EnableIO,
+				   kAudioUnitScope_Output, outputBus,
+				   &enable, sizeof(enable));
+	if (ret) {
+		warning("audiounit: EnableIO failed (%d)\n", ret);
+		goto out;
+	}
 
 	ret = AudioUnitSetProperty(st->au, kAudioUnitProperty_StreamFormat,
 				   kAudioUnitScope_Input, outputBus,
@@ -179,12 +250,14 @@ int audiounit_player_alloc(struct auplay_st **stp, const struct auplay *ap,
 	if (ret)
 		goto out;
 
-	cb.inputProc = output_callback;
-	cb.inputProcRefCon = st;
 	ret = AudioUnitSetProperty(st->au,
 				   kAudioUnitProperty_SetRenderCallback,
 				   kAudioUnitScope_Input, outputBus,
 				   &cb, sizeof(cb));
+	if (ret)
+		goto out;
+
+	ret = AudioUnitInitialize(st->au);
 	if (ret)
 		goto out;
 
@@ -200,6 +273,7 @@ int audiounit_player_alloc(struct auplay_st **stp, const struct auplay *ap,
 				   &hw_size);
 	if (ret)
 		goto out;
+#endif
 
 	debug("audiounit: player hardware sample rate is now at %f Hz\n",
 	      hw_srate);

@@ -41,3 +41,42 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 
 
 uint32_t audiounit_aufmt_to_formatflags(enum aufmt fmt);
+
+
+#if TARGET_OS_IPHONE
+
+/*
+ * Shared VoiceProcessingIO holder.
+ *
+ * iOS VPIO is effectively single-instance-per-process — two independent
+ * AudioComponentInstanceNew(VPIO) calls fight over the same mic+speaker
+ * hardware and produce `render err: -1` spam. Production iOS VoIP stacks
+ * (Linphone's msiounit, WebRTC's voice_processing_audio_unit) therefore
+ * share a single VPIO AU between the player (render) and recorder
+ * (input) filters. The holder below implements that pattern for baresip:
+ *
+ *   player.c  -> audiounit_holder_acquire(&st->au)
+ *             -> audiounit_holder_set_render_cb(cb)
+ *             -> audiounit_holder_set_output_format(fmt)
+ *             -> audiounit_holder_start()
+ *
+ *   recorder.c -> audiounit_holder_acquire(&st->au_in)
+ *              -> audiounit_holder_set_input_cb(cb)
+ *              -> audiounit_holder_set_input_format(fmt)
+ *              -> audiounit_holder_start()
+ *
+ *   both sides -> audiounit_holder_release() on teardown. Last release
+ *              stops, uninitializes and disposes the shared AU.
+ *
+ * All calls return 0 on success, errno on failure.
+ */
+
+int audiounit_holder_acquire(AudioComponentInstance *aup);
+int audiounit_holder_set_render_cb(const AURenderCallbackStruct *cb);
+int audiounit_holder_set_input_cb(const AURenderCallbackStruct *cb);
+int audiounit_holder_set_output_format(const AudioStreamBasicDescription *fmt);
+int audiounit_holder_set_input_format(const AudioStreamBasicDescription *fmt);
+int audiounit_holder_start(void);
+void audiounit_holder_release(void);
+
+#endif /* TARGET_OS_IPHONE */

@@ -16,6 +16,9 @@ struct ausrc_st {
 	struct audiosess_st *sess;
 	AudioUnit au_in;
 	AudioUnit au_conv;
+#if TARGET_OS_IPHONE
+	bool au_in_acquired;
+#endif
 	mtx_t mutex;
 	struct ausrc_prm prm;
 	uint32_t sampsz;
@@ -35,13 +38,23 @@ static void ausrc_destructor(void *arg)
 	st->rh = NULL;
 	mtx_unlock(&st->mutex);
 
+#if TARGET_OS_IPHONE
+	if (st->au_in_acquired) {
+		audiounit_holder_release();
+		st->au_in_acquired = false;
+	}
+	st->au_in = NULL;
+#else
 	AudioOutputUnitStop(st->au_in);
 	AudioUnitUninitialize(st->au_in);
 	AudioComponentInstanceDispose(st->au_in);
+#endif
 
-	AudioOutputUnitStop(st->au_conv);
-	AudioUnitUninitialize(st->au_conv);
-	AudioComponentInstanceDispose(st->au_conv);
+	if (st->au_conv) {
+		AudioOutputUnitStop(st->au_conv);
+		AudioUnitUninitialize(st->au_conv);
+		AudioComponentInstanceDispose(st->au_conv);
+	}
 
 	mem_deref(st->sess);
 	mem_deref(st->buf);
@@ -171,10 +184,24 @@ static void interrupt_handler(bool interrupted, void *arg)
 {
 	struct ausrc_st *st = arg;
 
+#if TARGET_OS_IPHONE
+	/*
+	 * On iOS the IO AU is shared; it's legal to call
+	 * Start/Stop on the shared instance from either filter.
+	 * The player filter mirrors this handler.
+	 */
+	if (!st->au_in)
+		return;
 	if (interrupted)
 		AudioOutputUnitStop(st->au_in);
 	else
 		AudioOutputUnitStart(st->au_in);
+#else
+	if (interrupted)
+		AudioOutputUnitStop(st->au_in);
+	else
+		AudioOutputUnitStart(st->au_in);
+#endif
 }
 
 
@@ -183,13 +210,13 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 			     ausrc_read_h *rh, ausrc_error_h *errh, void *arg)
 {
 	AudioStreamBasicDescription fmt, fmt_app;
-	const AudioUnitElement inputBus = 1;
 	const AudioUnitElement defaultBus = 0;
 	AURenderCallbackStruct cb_in, cb_conv;
 	struct ausrc_st *st;
-	const UInt32 enable = 1;
 #if ! TARGET_OS_IPHONE
+	const AudioUnitElement inputBus = 1;
 	const AudioUnitElement outputBus = 0;
+	const UInt32 enable = 1;
 	const UInt32 disable = 0;
 	UInt32 ausize = sizeof(AudioDeviceID);
 	AudioDeviceID inputDevice;
@@ -197,9 +224,9 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 		kAudioHardwarePropertyDefaultInputDevice,
 		kAudioObjectPropertyScopeGlobal,
 		kAudioObjectPropertyElementMain };
+	UInt32 hw_size = sizeof(hw_srate);
 #endif
 	Float64 hw_srate = 0.0;
-	UInt32 hw_size = sizeof(hw_srate);
 	size_t framesz;
 	OSStatus ret = 0;
 	int err;
@@ -239,6 +266,9 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 	if (err)
 		goto out;
 
+#if TARGET_OS_IPHONE
+	hw_srate = prm->srate;
+#else
 	ret = AudioComponentInstanceNew(audiounit_comp_io, &st->au_in);
 	if (ret)
 		goto out;
@@ -250,7 +280,6 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 	if (ret)
 		goto out;
 
-#if ! TARGET_OS_IPHONE
 	ret = AudioUnitSetProperty(st->au_in,
 				   kAudioOutputUnitProperty_EnableIO,
 				   kAudioUnitScope_Output, outputBus,
@@ -275,12 +304,7 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 			sizeof(inputDevice));
 	if (ret)
 		goto out;
-#endif
 
-#if TARGET_OS_IPHONE
-	hw_srate = prm->srate;
-	(void)hw_size;
-#else
 	ret = AudioUnitGetProperty(st->au_in,
 				   kAudioUnitProperty_SampleRate,
 				   kAudioUnitScope_Input,
@@ -313,25 +337,63 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 	fmt.mBytesPerPacket   = st->sampsz * prm->ch;
 	fmt.mReserved         = 0;
 
+	cb_in.inputProc = input_callback;
+	cb_in.inputProcRefCon = st;
+
+#if TARGET_OS_IPHONE
+	/*
+	 * iOS: share the VPIO instance with the player.
+	 * Holder handles EnableIO on both scopes already; we just
+	 * configure our input scope format + callback, then start.
+	 *
+	 * Order is Enable (done in holder) → format → callback →
+	 * Initialize → Start. Apple's docs require input callback
+	 * before Initialize: our holder's _start() performs
+	 * Initialize, so both _set_input_format() and
+	 * _set_input_cb() must land first — which they do.
+	 */
+	err = audiounit_holder_acquire(&st->au_in);
+	if (err) {
+		ret = 0;
+		goto out;
+	}
+	st->au_in_acquired = true;
+
+	err = audiounit_holder_set_input_format(&fmt);
+	if (err) {
+		ret = 0;
+		goto out;
+	}
+
+	err = audiounit_holder_set_input_cb(&cb_in);
+	if (err) {
+		ret = 0;
+		goto out;
+	}
+
+	err = audiounit_holder_start();
+	if (err) {
+		ret = 0;
+		goto out;
+	}
+#else
 	ret = AudioUnitSetProperty(st->au_in, kAudioUnitProperty_StreamFormat,
 				   kAudioUnitScope_Output, inputBus,
 				   &fmt, sizeof(fmt));
 	if (ret)
 		goto out;
 
-	/* NOTE: done after desc */
-	ret = AudioUnitInitialize(st->au_in);
-	if (ret)
-		goto out;
-
-	cb_in.inputProc = input_callback;
-	cb_in.inputProcRefCon = st;
 	ret = AudioUnitSetProperty(st->au_in,
 				   kAudioOutputUnitProperty_SetInputCallback,
 				   kAudioUnitScope_Global, inputBus,
 				   &cb_in, sizeof(cb_in));
 	if (ret)
 		goto out;
+
+	ret = AudioUnitInitialize(st->au_in);
+	if (ret)
+		goto out;
+#endif
 
 	fmt_app = fmt;
 	fmt_app.mSampleRate = prm->srate;
@@ -380,9 +442,12 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 	if (ret)
 		goto out;
 
+#if ! TARGET_OS_IPHONE
+	/* On iOS the shared holder already started the VPIO. */
 	ret = AudioOutputUnitStart(st->au_in);
 	if (ret)
 		goto out;
+#endif
 
  out:
 	if (ret) {
