@@ -89,6 +89,18 @@ static OSStatus input_callback(void *inRefCon,
 	if (!rh)
 		return 0;
 
+	/*
+	 * On macOS (Designed for iPad), RemoteIO starts firing input
+	 * callbacks the moment holder_set_input_cb's suspend/resume
+	 * cycle completes — which can happen before audiounit_recorder_alloc
+	 * has finished creating st->au_conv below. Real iOS VPIO buffers
+	 * the first few callbacks long enough for the converter to be
+	 * ready, so this race is Mac-only. Drop early-fire callbacks
+	 * rather than calling AudioUnitRender(NULL) and returning -50.
+	 */
+	if (!st->au_conv)
+		return noErr;
+
 	framesz = st->sampsz * st->prm.ch;
 	st->abl = &abl_in;
 

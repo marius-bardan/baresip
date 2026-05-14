@@ -4,6 +4,13 @@
  * Copyright (C) 2010 Alfred E. Heggestad
  */
 #include <AudioToolbox/AudioToolbox.h>
+/*
+ * On native macOS, <AudioToolbox/AudioToolbox.h> transitively includes the
+ * CoreAudio HAL headers. On Mac Catalyst it doesn't — explicitly include
+ * <CoreAudio/CoreAudio.h> so symbols like kAudioDevicePropertyScopeInput,
+ * kAudioHardwareNoError, AudioObjectGetPropertyDataSize, etc. are visible.
+ */
+#include <CoreAudio/CoreAudio.h>
 #include <re.h>
 #include <rem.h>
 #include <baresip.h>
