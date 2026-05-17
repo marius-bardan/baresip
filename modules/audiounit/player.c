@@ -134,13 +134,13 @@ int audiounit_player_alloc(struct auplay_st **stp, const struct auplay *ap,
 	AudioStreamBasicDescription fmt;
 	AURenderCallbackStruct cb;
 	struct auplay_st *st;
+	Float64 hw_srate = 0.0;
 #if ! TARGET_OS_IPHONE
 	const AudioUnitElement outputBus = 0;
 	const UInt32 enable = 1;
 	UInt32 hw_size = sizeof(hw_srate);
 #endif
 	OSStatus ret = 0;
-	Float64 hw_srate = 0.0;
 	int err;
 
 	(void)device;

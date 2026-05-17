@@ -225,6 +225,7 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 	const AudioUnitElement defaultBus = 0;
 	AURenderCallbackStruct cb_in, cb_conv;
 	struct ausrc_st *st;
+	Float64 hw_srate = 0.0;
 #if ! TARGET_OS_IPHONE
 	const AudioUnitElement inputBus = 1;
 	const AudioUnitElement outputBus = 0;
@@ -238,7 +239,6 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 		kAudioObjectPropertyElementMain };
 	UInt32 hw_size = sizeof(hw_srate);
 #endif
-	Float64 hw_srate = 0.0;
 	size_t framesz;
 	OSStatus ret = 0;
 	int err;
