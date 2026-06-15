@@ -852,7 +852,16 @@ static int media_alloc(struct mnat_media **mp, struct mnat_sess *sess,
 	m->compv[1].sock = mem_ref(sock2);
 	m->lpref = LPREF_INIT;
 
-	if (sess->offerer)
+	/* Relay-only clients must take the CONTROLLING role even when they are
+	   the SDP answerer (inbound PSTN calls). Only the controlling agent
+	   nominates a candidate pair; the controlled agent never sends
+	   USE-CANDIDATE. On inbound the client is the answerer, so the default
+	   offerer?CONTROLLING:CONTROLLED leaves it CONTROLLED — it then never
+	   nominates, ICE never completes, baresip keeps its audio device closed
+	   and silently drops the media that is already arriving. The ICE peer is
+	   always rtpengine (it bridges every leg) and it yields gracefully on role
+	   conflict, so forcing CONTROLLING here is safe for all call types. */
+	if (sess->offerer || ice.policy == ICE_POLICY_RELAY)
 		role = ICE_ROLE_CONTROLLING;
 	else
 		role = ICE_ROLE_CONTROLLED;
@@ -1029,7 +1038,9 @@ int ice_restart(struct mnat_sess *sess)
 		struct mnat_media *m = le->data;
 		enum ice_role role;
 
-		if (sess->offerer)
+		/* Same as media_alloc: relay-only clients stay CONTROLLING so the
+		   answerer (inbound) still nominates after a restart/handover. */
+		if (sess->offerer || ice.policy == ICE_POLICY_RELAY)
 			role = ICE_ROLE_CONTROLLING;
 		else
 			role = ICE_ROLE_CONTROLLED;
